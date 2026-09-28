@@ -1,0 +1,1336 @@
+"""
+Patients router — REST API endpoints for clinic patient profile management.
+"""
+from __future__ import annotations
+
+from datetime import datetime, time as dt_time, timedelta, timezone
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile, status
+from fastapi.responses import JSONResponse
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import get_current_user, get_db
+from app.api.v1.billing import invoice_to_out
+from app.core.exceptions import BadRequestError, BranchNotFoundError, NotFoundError, PermissionDeniedError
+from app.core.rbac import UserRole, require_roles
+from app.models.appointment import Appointment
+from app.models.consultation import Consultation
+from app.models.invoice import Invoice
+from app.models.medical_report import MedicalReport
+from app.models.patient import Patient
+from app.models.prescription import Prescription
+from app.models.user import User
+from app.repositories.doctor_repo import DoctorRepository
+from app.schemas.appointment import AppointmentOut
+from app.schemas.consultation import ConsultationOut
+from app.schemas.invoice import InvoiceOut
+from app.schemas.medical_report import MedicalReportOut
+from app.schemas.patient import (
+    FollowUpRecommendationOut,
+    PatientCreate,
+    PatientOut,
+    PatientPreferencesOut,
+    PatientPreferencesUpdate,
+    PatientUpdate,
+)
+from app.schemas.prescription import PrescriptionOut
+from app.schemas.treatment import TreatmentPlanOut
+from app.services.appointment_service import AppointmentService
+from app.services.billing_service import BillingService
+from app.services.consultation_service import ConsultationService
+from app.services.medical_report_service import MedicalReportService
+from app.services.patient_service import PatientService
+from app.services.prescription_service import PrescriptionService
+from app.services.storage_service import StorageService
+from app.services.treatment_service import TreatmentService
+from app.utils.response import ApiResponse
+
+router = APIRouter()
+
+
+# ── 1. GET /patients/me ───────────────────────────────────────────────────────
+@router.get(
+    "/me",
+    summary="Get current patient's clinical profile",
+)
+async def get_my_patient_profile(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    """Retrieve the clinical profile of the currently authenticated patient."""
+    if current_user.role != UserRole.PATIENT:
+        raise BadRequestError("Only patients have clinical profiles.")
+    
+    service = PatientService(db)
+    patient = await service.get_patient_by_user_id(current_user.id)
+    return ApiResponse.success(
+        data=PatientOut.model_validate(patient),
+        message="Patient profile fetched successfully.",
+    )
+
+
+# ── 2. PATCH /patients/me ─────────────────────────────────────────────────────
+@router.patch(
+    "/me",
+    summary="Update current patient's clinical profile",
+)
+async def update_my_patient_profile(
+    request: PatientUpdate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    """Update clinical details for the currently authenticated patient."""
+    if current_user.role != UserRole.PATIENT:
+        raise BadRequestError("Only patients have clinical profiles.")
+    
+    service = PatientService(db)
+    patient = await service.get_patient_by_user_id(current_user.id)
+    updated = await service.update_patient_profile(patient.id, request)
+    return ApiResponse.success(
+        data=PatientOut.model_validate(updated),
+        message="Your patient profile updated successfully.",
+    )
+
+
+# ── 2b. GET /patients/me/dashboard ────────────────────────────────────────────
+@router.get(
+    "/me/dashboard",
+    summary="Get patient portal dashboard stats and lists",
+)
+async def get_patient_dashboard(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    """
+    Fetch patient dashboard metadata, metric counts, upcoming appointments,
+    recent prescriptions, bills, medical reports, follow-ups, and history.
+    """
+    if current_user.role != UserRole.PATIENT:
+        raise BadRequestError("Only patients have a dashboard.")
+
+    def to_patient_appt_out(a) -> AppointmentOut:
+        out = AppointmentOut.model_validate(a)
+        out.map_status_for_role("patient")
+        return out
+
+    service = PatientService(db)
+    patient = await service.get_patient_by_user_id(current_user.id)
+    patient_id = patient.id
+
+    # 1. Preferred branch details
+    branch_name = None
+    if patient.preferred_branch_id:
+        branch = await service.branch_repo.get_by_id(patient.preferred_branch_id)
+        if branch:
+            branch_name = branch.name
+
+    # 2. Get appointments
+    appt_service = AppointmentService(db)
+    all_appts, _ = await appt_service.list_appointments(
+        page=1,
+        limit=100,
+        patient_id=patient_id,
+    )
+    
+    now = datetime.now(timezone.utc)
+    upcoming_appointments = []
+    appointment_history = []
+    for appt in all_appts:
+        if appt.status in ["pending", "confirmed", "checked_in", "in_consultation"]:
+            upcoming_appointments.append(appt)
+        else:
+            appointment_history.append(appt)
+
+    # Calculate queue estimation for upcoming appointments today
+    IST = timezone(timedelta(hours=5, minutes=30))
+    today_ist = datetime.now(IST).date()
+    upcoming_serialized = []
+    for appt in upcoming_appointments:
+        appt_out = to_patient_appt_out(appt)
+        appt_date_ist = appt.appointment_datetime.astimezone(IST).date()
+        if appt_date_ist == today_ist and appt.status in ["confirmed", "checked_in", "in_consultation"]:
+            day_start_ist = datetime.combine(today_ist, datetime.min.time()).replace(tzinfo=IST)
+            day_end_ist = datetime.combine(today_ist, datetime.max.time()).replace(tzinfo=IST)
+            doctor_appts_stmt = select(Appointment).where(
+                Appointment.doctor_id == appt.doctor_id,
+                Appointment.appointment_datetime >= day_start_ist,
+                Appointment.appointment_datetime <= day_end_ist,
+                Appointment.status.in_(["in_consultation", "checked_in", "confirmed"])
+            )
+            doctor_appts_res = await db.execute(doctor_appts_stmt)
+            doctor_appts = list(doctor_appts_res.scalars().all())
+
+            def queue_sort_key(a):
+                status_priority = {"in_consultation": 0, "checked_in": 1, "confirmed": 2}
+                return (status_priority.get(a.status, 3), a.appointment_datetime)
+
+            sorted_queue = sorted(doctor_appts, key=queue_sort_key)
+
+            try:
+                queue_index = next(idx for idx, a in enumerate(sorted_queue) if a.id == appt.id)
+                patients_ahead = queue_index
+                wait_minutes = patients_ahead * 15
+                if appt.status == "in_consultation":
+                    wait_minutes = 0
+            except StopIteration:
+                patients_ahead = 0
+                wait_minutes = 0
+
+            appt_dict = appt_out.model_dump()
+            appt_dict["queue_position"] = patients_ahead
+            appt_dict["estimated_wait_minutes"] = wait_minutes
+            upcoming_serialized.append(appt_dict)
+        else:
+            appt_dict = appt_out.model_dump()
+            appt_dict["queue_position"] = None
+            appt_dict["estimated_wait_minutes"] = None
+            upcoming_serialized.append(appt_dict)
+
+    # 3. Get prescriptions
+    prescription_service = PrescriptionService(db)
+    prescriptions, _ = await prescription_service.list_prescriptions(
+        page=1,
+        limit=50,
+        patient_id=patient_id,
+    )
+
+    # 4. Get medical history (consultations)
+    consultation_service = ConsultationService(db)
+    consultations, _ = await consultation_service.list_consultations(
+        page=1,
+        limit=50,
+        patient_id=patient_id,
+    )
+
+    # 5. Get medical reports
+    report_service = MedicalReportService(db)
+    reports = await report_service.get_reports_by_user_id(current_user.id)
+
+    # 6. Get bills (invoices)
+    billing_service = BillingService(db)
+    invoices, _ = await billing_service.list_invoices(
+        page=1,
+        limit=50,
+        patient_id=patient_id,
+    )
+
+    # 7. Get balance due
+    balance_stmt = (
+        select(func.sum(Invoice.balance_due))
+        .where(
+            Invoice.patient_id == patient_id,
+            Invoice.status.in_(["unpaid", "partially_paid"])
+        )
+    )
+    balance_res = await db.execute(balance_stmt)
+    total_balance_due = float(balance_res.scalar() or 0.0)
+
+    # 8. Get visits this year
+    current_year = datetime.now(timezone.utc).year
+    start_of_year = datetime(current_year, 1, 1, tzinfo=timezone.utc)
+    visits_stmt = (
+        select(func.count(Consultation.id))
+        .where(
+            Consultation.patient_id == patient_id,
+            Consultation.consultation_datetime >= start_of_year
+        )
+    )
+    visits_res = await db.execute(visits_stmt)
+    visits_this_year = visits_res.scalar_one()
+
+    # 9. Get follow-ups
+    stmt = (
+        select(Appointment)
+        .where(
+            Appointment.patient_id == patient_id,
+            Appointment.status.in_(["pending", "confirmed"])
+        )
+    )
+    result = await db.execute(stmt)
+    future_appointments = list(result.scalars().all())
+
+    follow_ups = []
+    seen_dash_fu = set()
+    for c in consultations:
+        if not getattr(c, "followup_advised", False):
+            continue
+        days = getattr(c, "followup_after_days", 0) or 0
+        if days <= 0:
+            continue
+        if c.id in seen_dash_fu:
+            continue
+        seen_dash_fu.add(c.id)
+
+        recommended_date = c.consultation_datetime + timedelta(days=days)
+        has_future_booking = any(
+            appt.doctor_id == c.doctor_id and appt.appointment_datetime > c.consultation_datetime
+            for appt in future_appointments
+        )
+        status = "booked" if has_future_booking else "recommended"
+
+        treatment_type = "Routine Follow-up"
+        if c.diagnosis:
+            treatment_type = f"Follow-up for {c.diagnosis}"
+
+        follow_ups.append({
+            "id": c.id,
+            "consultation_id": c.id,
+            "doctor_id": c.doctor_id,
+            "doctor_name": c.doctor.user.full_name if c.doctor and c.doctor.user else "Doctor",
+            "branch_id": c.branch_id,
+            "branch_name": c.branch.name if c.branch else "Main Branch",
+            "recommended_date": recommended_date,
+            "treatment_type": treatment_type,
+            "notes": f"Recommended after {days} days based on your visit on {c.consultation_datetime.strftime('%Y-%m-%d')}.",
+            "status": status,
+        })
+
+    # Return unified payload supporting both simple statistics and full detail lists
+    return ApiResponse.success(
+        data={
+            "patient_code": patient.patient_code,
+            "full_name": patient.user.full_name if patient.user else None,
+            "preferred_branch": branch_name,
+            "upcoming_appointments_count": len(upcoming_appointments),
+            "active_prescriptions_count": len(prescriptions),
+            "balance_due": total_balance_due,
+            "visits_this_year": visits_this_year,
+            "upcoming_appointments": upcoming_serialized,
+            "appointment_history": [to_patient_appt_out(a) for a in appointment_history],
+            "past_appointments": [to_patient_appt_out(a) for a in appointment_history],
+            "prescriptions": [PrescriptionOut.model_validate(p) for p in prescriptions],
+            "recent_prescriptions": [PrescriptionOut.model_validate(p) for p in prescriptions],
+            "medical_history": [ConsultationOut.model_validate(c) for c in consultations],
+            "reports": [MedicalReportOut.model_validate(r) for r in reports],
+            "bills": [invoice_to_out(i) for i in invoices],
+            "follow_ups": [FollowUpRecommendationOut.model_validate(f) for f in follow_ups],
+        },
+        message="Patient dashboard data fetched successfully.",
+    )
+
+
+# ── 2c. GET /patients/me/appointments ─────────────────────────────────────────
+@router.get(
+    "/me/appointments",
+    summary="Get appointments of the logged-in patient",
+)
+async def list_my_appointments(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    status: str | None = Query(None, description="Filter by status (pending, confirmed, completed, cancelled)"),
+    date: str | None = Query(None, description="Filter by date (YYYY-MM-DD)"),
+    search: str | None = Query(None, description="Search by doctor name or treatment type"),
+) -> JSONResponse:
+    """Retrieve paginated appointments for the logged-in patient with status, date, and search filters."""
+    if current_user.role != UserRole.PATIENT:
+        raise BadRequestError("Only patients can query their appointments this way.")
+
+    service = PatientService(db)
+    patient = await service.get_patient_by_user_id(current_user.id)
+
+    start_date = None
+    end_date = None
+    if date:
+        try:
+            parsed_date = datetime.strptime(date, "%Y-%m-%d").date()
+            start_date = datetime.combine(parsed_date, dt_time.min, tzinfo=timezone.utc)
+            end_date = datetime.combine(parsed_date, dt_time.max, tzinfo=timezone.utc)
+        except ValueError:
+            raise BadRequestError("Invalid date format. Expected YYYY-MM-DD.")
+
+    appt_service = AppointmentService(db)
+    items, total = await appt_service.list_appointments(
+        page=page,
+        limit=limit,
+        patient_id=patient.id,
+        status=status,
+        start_date=start_date,
+        end_date=end_date,
+        search=search,
+    )
+    pages = (total + limit - 1) // limit
+
+    def to_patient_appt_out(item):
+        out = AppointmentOut.model_validate(item)
+        out.map_status_for_role("patient")
+        return out
+
+    return ApiResponse.success(
+        data={
+            "items": [to_patient_appt_out(item) for item in items],
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "pages": pages,
+        },
+        message="Patient appointments retrieved successfully.",
+    )
+
+
+# ── 2d. GET /patients/me/prescriptions ────────────────────────────────────────
+@router.get(
+    "/me/prescriptions",
+    summary="Get prescriptions of the logged-in patient",
+)
+async def list_my_prescriptions(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+) -> JSONResponse:
+    """Retrieve paginated prescriptions for the logged-in patient."""
+    if current_user.role != UserRole.PATIENT:
+        raise BadRequestError("Only patients can query their prescriptions this way.")
+
+    service = PatientService(db)
+    patient = await service.get_patient_by_user_id(current_user.id)
+
+    presc_service = PrescriptionService(db)
+    items, total = await presc_service.list_prescriptions(
+        page=page,
+        limit=limit,
+        patient_id=patient.id,
+    )
+    pages = (total + limit - 1) // limit
+
+    return ApiResponse.success(
+        data={
+            "items": [PrescriptionOut.model_validate(item) for item in items],
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "pages": pages,
+        },
+        message="Patient prescriptions retrieved successfully.",
+    )
+
+
+# ── 2e. GET /patients/me/medical-history ──────────────────────────────────────
+@router.get(
+    "/me/medical-history",
+    summary="Get medical history / visits of the logged-in patient",
+)
+async def list_my_medical_history(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+) -> JSONResponse:
+    """Retrieve paginated consultations/visits for the logged-in patient."""
+    if current_user.role != UserRole.PATIENT:
+        raise BadRequestError("Only patients can query their medical history this way.")
+
+    service = PatientService(db)
+    patient = await service.get_patient_by_user_id(current_user.id)
+
+    consultation_service = ConsultationService(db)
+    items, total = await consultation_service.list_consultations(
+        page=page,
+        limit=limit,
+        patient_id=patient.id,
+    )
+    pages = (total + limit - 1) // limit
+
+    return ApiResponse.success(
+        data={
+            "items": [ConsultationOut.model_validate(item) for item in items],
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "pages": pages,
+        },
+        message="Patient medical history retrieved successfully.",
+    )
+
+
+# ── 2f. GET /patients/me/treatments ───────────────────────────────────────────
+@router.get(
+    "/me/treatments",
+    summary="Get treatments/treatment plans of the logged-in patient",
+)
+async def list_my_treatments(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    status: str | None = Query(None),
+) -> JSONResponse:
+    """Retrieve paginated treatment plans for the logged-in patient."""
+    if current_user.role != UserRole.PATIENT:
+        raise BadRequestError("Only patients can query their treatments this way.")
+
+    service = PatientService(db)
+    patient = await service.get_patient_by_user_id(current_user.id)
+
+    treatment_service = TreatmentService(db)
+    items, total = await treatment_service.list_treatment_plans(
+        page=page,
+        limit=limit,
+        patient_id=patient.id,
+        status=status,
+    )
+    pages = (total + limit - 1) // limit
+
+    return ApiResponse.success(
+        data={
+            "items": [TreatmentPlanOut.model_validate(item) for item in items],
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "pages": pages,
+        },
+        message="Patient treatments retrieved successfully.",
+    )
+
+
+# ── 2g. GET /patients/me/reports ──────────────────────────────────────────────
+@router.get(
+    "/me/reports",
+    summary="Get medical reports of the logged-in patient",
+)
+async def list_my_reports(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    """Retrieve all uploaded medical reports for the logged-in patient."""
+    if current_user.role != UserRole.PATIENT:
+        raise BadRequestError("Only patients can query their reports this way.")
+
+    service = MedicalReportService(db)
+    reports = await service.get_reports_by_user_id(current_user.id)
+    return ApiResponse.success(
+        data=[MedicalReportOut.model_validate(r) for r in reports],
+        message="Patient medical reports retrieved successfully.",
+    )
+
+
+# ── 2g-post. POST /patients/me/reports ─────────────────────────────────────────
+@router.post(
+    "/me/reports",
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload a new medical report for the logged-in patient",
+)
+async def upload_my_report(
+    request: Request,
+    file: UploadFile = File(...),
+    report_type: str = Form(...),
+    title: str | None = Form(None),
+    current_user: Annotated[User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_db)] = None,
+) -> JSONResponse:
+    """Upload a medical report file and store metadata for the authenticated patient."""
+    if current_user.role != UserRole.PATIENT:
+        raise BadRequestError("Only patients can upload medical reports.")
+
+    patient_service = PatientService(db)
+    patient = await patient_service.get_patient_by_user_id(current_user.id)
+    patient_id_str = str(patient.id) if patient is not None else str(current_user.id)
+
+    file_url = await StorageService.upload_medical_report(file, patient_id=patient_id_str, request=request)
+    report_name = title or file.filename or "report.pdf"
+
+    service = MedicalReportService(db)
+    report = await service.create_report(
+        user_id=current_user.id,
+        report_type=report_type,
+        report_name=report_name,
+        file_url=file_url,
+    )
+
+    return ApiResponse.success(
+        data=MedicalReportOut.model_validate(report),
+        message="Medical report uploaded successfully.",
+        status_code=status.HTTP_201_CREATED,
+    )
+
+
+# ── 2g-delete. DELETE /patients/me/reports/{report_id} ─────────────────────────
+@router.delete(
+    "/me/reports/{report_id}",
+    summary="Delete a medical report owned by the logged-in patient",
+)
+async def delete_my_report(
+    report_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    """Delete a medical report if owned by the logged-in patient."""
+    if current_user.role != UserRole.PATIENT:
+        raise BadRequestError("Only patients can delete their own medical reports.")
+
+    service = MedicalReportService(db)
+    await service.delete_report(
+        user_id=current_user.id,
+        user_role=current_user.role,
+        report_id=report_id,
+    )
+
+    return ApiResponse.success(
+        message="Medical report deleted successfully.",
+    )
+
+
+# ── 2i. GET /patients/me/follow-ups ───────────────────────────────────────────
+@router.get(
+    "/me/follow-ups",
+    summary="Get recommended follow-ups for the logged-in patient",
+)
+async def list_my_follow_ups(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    """Retrieve recommended follow-ups based on the patient's previous consultations."""
+    if current_user.role != UserRole.PATIENT:
+        raise BadRequestError("Only patients can query their follow-ups.")
+
+    service = PatientService(db)
+    patient = await service.get_patient_by_user_id(current_user.id)
+
+    consultation_service = ConsultationService(db)
+    consultations, _ = await consultation_service.list_consultations(
+        page=1,
+        limit=100,
+        patient_id=patient.id,
+    )
+
+    stmt = (
+        select(Appointment)
+        .where(
+            Appointment.patient_id == patient.id,
+            Appointment.status.in_(["pending", "confirmed"])
+        )
+    )
+    result = await db.execute(stmt)
+    future_appointments = list(result.scalars().all())
+
+    recommendations = []
+    for c in consultations:
+        if not getattr(c, "followup_advised", False):
+            continue
+
+        days = getattr(c, "followup_after_days", 14) or 14
+        recommended_date = c.consultation_datetime + timedelta(days=days)
+        
+        has_future_booking = any(
+            appt.doctor_id == c.doctor_id and appt.appointment_datetime > c.consultation_datetime
+            for appt in future_appointments
+        )
+        status = "booked" if has_future_booking else "recommended"
+
+        treatment_type = "Routine Follow-up"
+        if c.diagnosis:
+            treatment_type = f"Follow-up for {c.diagnosis}"
+
+        recommendations.append({
+            "id": c.id,
+            "consultation_id": c.id,
+            "doctor_id": c.doctor_id,
+            "doctor_name": c.doctor.user.full_name if c.doctor and c.doctor.user else "Doctor",
+            "branch_id": c.branch_id,
+            "branch_name": c.branch.name if c.branch else "Main Branch",
+            "recommended_date": recommended_date,
+            "treatment_type": treatment_type,
+            "notes": f"Recommended follow-up based on your visit on {c.consultation_datetime.strftime('%Y-%m-%d')}.",
+            "status": status,
+        })
+
+    return ApiResponse.success(
+        data=[FollowUpRecommendationOut.model_validate(r) for r in recommendations],
+        message="Patient follow-up recommendations retrieved successfully.",
+    )
+
+
+# ── 2h. GET /patients/me/billing ──────────────────────────────────────────────
+@router.get(
+    "/me/billing",
+    summary="Get billing invoices of the logged-in patient",
+)
+async def list_my_billing(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    status: str | None = Query(None, description="Filter by status (unpaid, partially_paid, paid, cancelled)"),
+) -> JSONResponse:
+    """Retrieve paginated invoices for the logged-in patient."""
+    if current_user.role != UserRole.PATIENT:
+        raise BadRequestError("Only patients can query their invoices this way.")
+
+    service = PatientService(db)
+    patient = await service.get_patient_by_user_id(current_user.id)
+
+    billing_service = BillingService(db)
+    items, total = await billing_service.list_invoices(
+        page=page,
+        limit=limit,
+        patient_id=patient.id,
+        status=status,
+    )
+    pages = (total + limit - 1) // limit
+
+    return ApiResponse.success(
+        data={
+            "items": [invoice_to_out(item) for item in items],
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "pages": pages,
+        },
+        message="Patient billing invoices retrieved successfully.",
+    )
+
+
+# ── 2j. POST /patients/ (Create Walk-in Patient) ──────────────────────────────
+@router.post(
+    "/",
+    summary="Create walk-in patient (staff/receptionist only)",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_roles(UserRole.ADMIN, UserRole.RECEPTIONIST, UserRole.CLINIC_MANAGER))],
+)
+async def create_walkin_patient(
+    request: PatientCreate,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    """Create a new pre-verified patient record for walk-ins (bypassing OTP)."""
+    service = PatientService(db)
+    patient = await service.create_walkin_patient(request)
+    return ApiResponse.success(
+        data=PatientOut.model_validate(patient),
+        message="Walk-in patient registered successfully.",
+        status_code=status.HTTP_201_CREATED,
+    )
+
+
+# ── 3. GET /patients ──────────────────────────────────────────────────────────
+@router.get(
+    "/",
+    summary="List and search patients (staff only)",
+    dependencies=[Depends(require_roles(UserRole.ADMIN, UserRole.DOCTOR, UserRole.RECEPTIONIST, UserRole.PHARMACIST, UserRole.CLINIC_MANAGER))],
+)
+async def list_patients(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    search: str | None = Query(None, description="Search by name, patient code, or phone number"),
+) -> JSONResponse:
+    """Get paginated, searchable list of clinic patients."""
+    service = PatientService(db)
+    items, total = await service.get_all_patients(page=page, limit=limit, search=search)
+    pages = (total + limit - 1) // limit
+
+    return ApiResponse.success(
+        data={
+            "items": [PatientOut.model_validate(item) for item in items],
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "pages": pages,
+        },
+        message="Patients retrieved successfully.",
+    )
+
+
+# ── 4. GET /patients/{patient_id} ─────────────────────────────────────────────
+@router.get(
+    "/{patient_id}",
+    summary="Get patient details by ID",
+)
+async def get_patient_details(
+    patient_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    """
+    Fetch profile details of a single patient by UUID.
+    Staff/admins can view any profile; patients can only view their own.
+    """
+    service = PatientService(db)
+    patient = await service.get_patient(patient_id)
+    
+    if current_user.role == UserRole.PATIENT and patient.user_id != current_user.id:
+        raise PermissionDeniedError("You are not allowed to view other patient profiles.")
+        
+    return ApiResponse.success(
+        data=PatientOut.model_validate(patient),
+        message="Patient details retrieved successfully.",
+    )
+
+
+# ── 5. PUT /patients/{patient_id} ─────────────────────────────────────────────
+@router.put(
+    "/{patient_id}",
+    summary="Update patient details (staff or owner)",
+)
+async def update_patient(
+    patient_id: UUID,
+    request: PatientUpdate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    """
+    Update clinical details of a patient.
+    Admins/receptionists can update any patient; patients can update their own.
+    """
+    service = PatientService(db)
+    patient = await service.get_patient(patient_id)
+    
+    is_staff = current_user.role in (UserRole.ADMIN, UserRole.RECEPTIONIST, UserRole.DOCTOR, UserRole.CLINIC_MANAGER)
+    is_owner = patient.user_id == current_user.id
+    
+    if not (is_staff or is_owner):
+        raise PermissionDeniedError("You do not have permission to update this profile.")
+        
+    updated = await service.update_patient_profile(patient_id, request)
+    return ApiResponse.success(
+        data=PatientOut.model_validate(updated),
+        message="Patient details updated successfully.",
+    )
+
+
+# ── 6. POST /patients/{patient_id}/deactivate ─────────────────────────────────
+@router.post(
+    "/{patient_id}/deactivate",
+    summary="Deactivate patient (admin/receptionist only)",
+    dependencies=[Depends(require_roles(UserRole.ADMIN, UserRole.RECEPTIONIST))],
+)
+async def deactivate_patient(
+    patient_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    """Soft-deactivate a patient profile (sets is_active to False)."""
+    service = PatientService(db)
+    patient = await service.deactivate_patient(patient_id)
+    return ApiResponse.success(
+        data=PatientOut.model_validate(patient),
+        message="Patient profile deactivated successfully.",
+    )
+
+
+# ── 7. POST /patients/{patient_id}/activate ───────────────────────────────────
+@router.post(
+    "/{patient_id}/activate",
+    summary="Activate patient (admin/receptionist only)",
+    dependencies=[Depends(require_roles(UserRole.ADMIN, UserRole.RECEPTIONIST))],
+)
+async def activate_patient(
+    patient_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    """Re-activate a previously deactivated patient profile."""
+    service = PatientService(db)
+    patient = await service.activate_patient(patient_id)
+    return ApiResponse.success(
+        data=PatientOut.model_validate(patient),
+        message="Patient profile activated successfully.",
+    )
+
+
+# ── 8. GET /patients/me/preferences ──────────────────────────────────────────
+@router.get(
+    "/me/preferences",
+    summary="Get logged-in patient's preferences",
+)
+async def get_patient_preferences(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    """Retrieve language, notification, doctor, and consultation preferences."""
+    if current_user.role != UserRole.PATIENT:
+        raise BadRequestError("Only patients have preferences.")
+
+    service = PatientService(db)
+    patient = await service.get_patient_by_user_id(current_user.id)
+    return ApiResponse.success(
+        data=PatientPreferencesOut.model_validate(patient),
+        message="Patient preferences retrieved successfully.",
+    )
+
+
+# ── 9. PATCH / PUT /patients/me/preferences ──────────────────────────────────
+@router.patch(
+    "/me/preferences",
+    summary="Update logged-in patient's preferences",
+)
+@router.put(
+    "/me/preferences",
+    summary="Update logged-in patient's preferences (PUT fallback)",
+)
+async def update_patient_preferences(
+    request: PatientPreferencesUpdate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    """Update language, notification, doctor, and consultation preferences."""
+    if current_user.role != UserRole.PATIENT:
+        raise BadRequestError("Only patients can update preferences.")
+
+    service = PatientService(db)
+    patient = await service.get_patient_by_user_id(current_user.id)
+
+    update_data = request.model_dump(exclude_unset=True)
+    
+    if "preferred_doctor_id" in update_data and update_data["preferred_doctor_id"] is not None:
+        doctor_repo = DoctorRepository(db)
+        doctor = await doctor_repo.get_by_id(update_data["preferred_doctor_id"])
+        if not doctor:
+            raise BadRequestError("Preferred doctor not found.")
+
+    if "preferred_branch_id" in update_data and update_data["preferred_branch_id"] is not None:
+        branch = await service.branch_repo.get_by_id(update_data["preferred_branch_id"])
+        if not branch:
+            raise BranchNotFoundError()
+
+    updated = await service.patient_repo.update(patient, update_data)
+    await db.commit()
+
+    return ApiResponse.success(
+        data=PatientPreferencesOut.model_validate(updated),
+        message="Patient preferences updated successfully.",
+    )
+
+
+# ── 10. GET /patients/me/statistics ──────────────────────────────────────────
+@router.get(
+    "/me/statistics",
+    summary="Get logged-in patient's stats",
+)
+async def get_patient_statistics(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    """Get metrics including total visits, upcoming/cancelled/completed appointments, active Rx, bills, etc."""
+    if current_user.role != UserRole.PATIENT:
+        raise BadRequestError("Only patients have statistics.")
+
+    service = PatientService(db)
+    patient = await service.get_patient_by_user_id(current_user.id)
+    patient_id = patient.id
+
+    # 1. Appointments counts
+    appt_stmt = (
+        select(Appointment.status, Appointment.appointment_datetime)
+        .where(Appointment.patient_id == patient_id)
+    )
+    appt_res = await db.execute(appt_stmt)
+    appts_data = appt_res.all()
+    
+    upcoming_count = 0
+    completed_count = 0
+    cancelled_count = 0
+    now = datetime.now(timezone.utc)
+    
+    for status, appt_dt in appts_data:
+        if appt_dt.tzinfo is None:
+            appt_dt = appt_dt.replace(tzinfo=timezone.utc)
+        if status == "cancelled":
+            cancelled_count += 1
+        elif status == "completed" or (appt_dt < now and status in ["checked_in", "in_consultation"]):
+            completed_count += 1
+        elif appt_dt >= now and status in ["pending", "confirmed"]:
+            upcoming_count += 1
+
+    # 2. Active prescriptions count
+    presc_stmt = select(func.count(Prescription.id)).where(Prescription.patient_id == patient_id)
+    presc_res = await db.execute(presc_stmt)
+    active_prescriptions_count = presc_res.scalar() or 0
+
+    # 3. Medical history (visits) count
+    consult_stmt = select(func.count(Consultation.id)).where(Consultation.patient_id == patient_id)
+    consult_res = await db.execute(consult_stmt)
+    total_visits = consult_res.scalar() or 0
+
+    # 4. Reports count
+    report_stmt = select(func.count(MedicalReport.id)).where(MedicalReport.patient_id == patient_id)
+    report_res = await db.execute(report_stmt)
+    uploaded_reports_count = report_res.scalar() or 0
+
+    # 5. Pending bills count and balance due
+    invoice_count_stmt = (
+        select(func.count(Invoice.id))
+        .where(
+            Invoice.patient_id == patient_id,
+            Invoice.status.in_(["unpaid", "partially_paid"])
+        )
+    )
+    invoice_count_res = await db.execute(invoice_count_stmt)
+    pending_bills_count = invoice_count_res.scalar() or 0
+    
+    balance_stmt = (
+        select(func.sum(Invoice.balance_due))
+        .where(
+            Invoice.patient_id == patient_id,
+            Invoice.status.in_(["unpaid", "partially_paid"])
+        )
+    )
+    balance_res = await db.execute(balance_stmt)
+    total_balance_due = float(balance_res.scalar() or 0.0)
+
+    # 6. Follow-up count
+    consults_query = (
+        select(Consultation.doctor_id, Consultation.consultation_datetime)
+        .where(Consultation.patient_id == patient_id)
+    )
+    consults_res = await db.execute(consults_query)
+    consults_data = consults_res.all()
+
+    future_appt_stmt = (
+        select(Appointment.doctor_id, Appointment.appointment_datetime)
+        .where(
+            Appointment.patient_id == patient_id,
+            Appointment.status.in_(["pending", "confirmed"])
+        )
+    )
+    future_appt_res = await db.execute(future_appt_stmt)
+    future_appts_data = future_appt_res.all()
+    
+    follow_up_count = 0
+    for doc_id, consult_dt in consults_data:
+        if consult_dt.tzinfo is None:
+            consult_dt = consult_dt.replace(tzinfo=timezone.utc)
+        
+        has_future_booking = False
+        for appt_doc_id, appt_dt in future_appts_data:
+            if appt_dt.tzinfo is None:
+                appt_dt = appt_dt.replace(tzinfo=timezone.utc)
+            if appt_doc_id == doc_id and appt_dt > consult_dt:
+                has_future_booking = True
+                break
+        if not has_future_booking:
+            follow_up_count += 1
+
+    return ApiResponse.success(
+        data={
+            "total_visits": total_visits,
+            "upcoming_appointments": upcoming_count,
+            "cancelled_appointments": cancelled_count,
+            "completed_appointments": completed_count,
+            "active_prescriptions": active_prescriptions_count,
+            "pending_bills": pending_bills_count,
+            "balance_due": total_balance_due,
+            "uploaded_reports": uploaded_reports_count,
+            "follow_up_count": follow_up_count,
+        },
+        message="Patient statistics retrieved successfully.",
+    )
+
+
+# ── 11. GET /patients/me/timeline ────────────────────────────────────────────
+@router.get(
+    "/me/timeline",
+    summary="Get patient's medical history timeline",
+)
+async def get_patient_timeline(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    """Retrieve a chronologically ordered feed of visits, prescriptions, reports, invoices, and follow-ups."""
+    if current_user.role != UserRole.PATIENT:
+        raise BadRequestError("Only patients can view their timeline.")
+
+    service = PatientService(db)
+    patient = await service.get_patient_by_user_id(current_user.id)
+    patient_id = patient.id
+
+    timeline = []
+
+    # 1. Fetch Consultations (Visits)
+    consult_service = ConsultationService(db)
+    consults, _ = await consult_service.list_consultations(page=1, limit=100, patient_id=patient_id)
+    for c in consults:
+        timeline.append({
+            "event_type": "visit",
+            "title": f"Consultation with Dr. {c.doctor.user.full_name if c.doctor and c.doctor.user else 'Doctor'}",
+            "datetime": c.consultation_datetime.isoformat(),
+            "details": {
+                "diagnosis": c.diagnosis,
+                "symptoms": c.symptoms,
+                "notes": c.notes,
+            }
+        })
+
+    # 2. Fetch Prescriptions
+    presc_service = PrescriptionService(db)
+    prescs, _ = await presc_service.list_prescriptions(page=1, limit=100, patient_id=patient_id)
+    for p in prescs:
+        timeline.append({
+            "event_type": "prescription",
+            "title": f"Prescription Issued by Dr. {p.doctor.user.full_name if p.doctor and p.doctor.user else 'Doctor'}",
+            "datetime": p.created_at.isoformat(),
+            "details": {
+                "prescription_id": str(p.id),
+                "medicines": [
+                    {
+                        "name": item.medicine_name,
+                        "dosage": item.dosage,
+                        "duration": item.duration,
+                        "instructions": item.instructions
+                    } for item in p.items
+                ]
+            }
+        })
+
+    # 3. Fetch Reports
+    report_service = MedicalReportService(db)
+    reports = await report_service.get_reports_by_user_id(current_user.id)
+    for r in reports:
+        timeline.append({
+            "event_type": "report",
+            "title": f"Medical Report Uploaded: {r.report_name}",
+            "datetime": r.uploaded_at.isoformat(),
+            "details": {
+                "report_id": str(r.id),
+                "report_type": r.report_type,
+                "file_url": r.file_url
+            }
+        })
+
+    # 4. Fetch Invoices (Bills)
+    billing_service = BillingService(db)
+    invoices, _ = await billing_service.list_invoices(page=1, limit=100, patient_id=patient_id)
+    for inv in invoices:
+        timeline.append({
+            "event_type": "invoice",
+            "title": f"Invoice Generated - {inv.invoice_number}",
+            "datetime": inv.created_at.isoformat(),
+            "details": {
+                "invoice_id": str(inv.id),
+                "total_amount": float(inv.total_amount),
+                "balance_due": float(inv.balance_due),
+                "status": inv.status
+            }
+        })
+
+    # 5. Fetch Follow-up Recommendations
+    stmt = (
+        select(Appointment)
+        .where(
+            Appointment.patient_id == patient_id,
+            Appointment.status.in_(["pending", "confirmed"])
+        )
+    )
+    result = await db.execute(stmt)
+    future_appointments = list(result.scalars().all())
+
+    seen_followup_consultations = set()
+    for c in consults:
+        if not getattr(c, "followup_advised", False):
+            continue
+        days = getattr(c, "followup_after_days", 0) or 0
+        if days <= 0:
+            continue
+        if c.id in seen_followup_consultations:
+            continue
+        seen_followup_consultations.add(c.id)
+
+        recommended_date = c.consultation_datetime + timedelta(days=days)
+        has_future_booking = any(
+            appt.doctor_id == c.doctor_id and appt.appointment_datetime > c.consultation_datetime
+            for appt in future_appointments
+        )
+        status = "booked" if has_future_booking else "recommended"
+
+        doc_name = c.doctor.user.full_name if c.doctor and c.doctor.user else "Doctor"
+        treatment_type = f"Follow-up for {c.diagnosis}" if c.diagnosis else "Routine Follow-up"
+
+        timeline.append({
+            "event_type": "followup",
+            "title": f"Follow-up Recommended with Dr. {doc_name}",
+            "datetime": recommended_date.isoformat(),
+            "details": {
+                "consultation_id": str(c.id),
+                "doctor_id": str(c.doctor_id) if c.doctor_id else None,
+                "doctor_name": doc_name,
+                "branch_id": str(c.branch_id) if c.branch_id else None,
+                "treatment_type": treatment_type,
+                "recommended_date": recommended_date.isoformat(),
+                "status": status,
+                "notes": f"Recommended after {days} days based on visit on {c.consultation_datetime.strftime('%Y-%m-%d')} for {c.diagnosis or 'Routine'}."
+            }
+        })
+
+    # Deduplicate timeline events by unique key
+    unique_timeline = []
+    seen_timeline_keys = set()
+    for event in timeline:
+        key = (event["event_type"], event["title"], event["datetime"])
+        if key not in seen_timeline_keys:
+            seen_timeline_keys.add(key)
+            unique_timeline.append(event)
+
+    # Sort timeline by datetime descending
+    unique_timeline.sort(key=lambda x: x["datetime"], reverse=True)
+
+    return ApiResponse.success(
+        data=unique_timeline,
+        message="Patient medical timeline retrieved successfully.",
+    )
+
+
+# ── 12. GET /patients/{patient_id}/history-profile ───────────────────────────
+@router.get(
+    "/{patient_id}/history-profile",
+    summary="Get patient's complete history and profile (staff only)",
+    dependencies=[Depends(require_roles(UserRole.ADMIN, UserRole.DOCTOR, UserRole.RECEPTIONIST))],
+)
+async def get_patient_history_profile(
+    patient_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JSONResponse:
+    """
+    Fetch patient demographic details, stats, upcoming and past appointments,
+    prescriptions, medical history, invoices, and follow-ups.
+    """
+    def to_patient_appt_out(a) -> AppointmentOut:
+        out = AppointmentOut.model_validate(a)
+        out.map_status_for_role("patient")
+        return out
+
+    service = PatientService(db)
+    patient = await service.get_patient(patient_id)
+    if not patient:
+        raise NotFoundError("Patient not found.")
+
+    # 1. Preferred branch details
+    branch_name = None
+    if patient.preferred_branch_id:
+        branch = await service.branch_repo.get_by_id(patient.preferred_branch_id)
+        if branch:
+            branch_name = branch.name
+
+    # 2. Get appointments
+    appt_service = AppointmentService(db)
+    all_appts, _ = await appt_service.list_appointments(
+        page=1,
+        limit=100,
+        patient_id=patient_id,
+    )
+    
+    upcoming_appointments = []
+    appointment_history = []
+    for appt in all_appts:
+        if appt.status in ["pending", "confirmed", "checked_in", "in_consultation"]:
+            upcoming_appointments.append(appt)
+        else:
+            appointment_history.append(appt)
+
+    # 3. Get prescriptions
+    prescription_service = PrescriptionService(db)
+    prescriptions, _ = await prescription_service.list_prescriptions(
+        page=1,
+        limit=50,
+        patient_id=patient_id,
+    )
+
+    # 4. Get medical history (consultations)
+    consultation_service = ConsultationService(db)
+    consultations, _ = await consultation_service.list_consultations(
+        page=1,
+        limit=50,
+        patient_id=patient_id,
+    )
+
+    # 5. Get medical reports
+    report_service = MedicalReportService(db)
+    reports = await report_service.get_reports_by_user_id(patient.user_id) if patient.user_id else []
+
+    # 6. Get bills (invoices)
+    billing_service = BillingService(db)
+    invoices, _ = await billing_service.list_invoices(
+        page=1,
+        limit=50,
+        patient_id=patient_id,
+    )
+
+    # 7. Get balance due
+    balance_stmt = (
+        select(func.sum(Invoice.balance_due))
+        .where(
+            Invoice.patient_id == patient_id,
+            Invoice.status.in_(["unpaid", "partially_paid"])
+        )
+    )
+    balance_res = await db.execute(balance_stmt)
+    total_balance_due = float(balance_res.scalar() or 0.0)
+
+    # 8. Get visits this year
+    current_year = datetime.now(timezone.utc).year
+    start_of_year = datetime(current_year, 1, 1, tzinfo=timezone.utc)
+    visits_stmt = (
+        select(func.count(Consultation.id))
+        .where(
+            Consultation.patient_id == patient_id,
+            Consultation.consultation_datetime >= start_of_year
+        )
+    )
+    visits_res = await db.execute(visits_stmt)
+    visits_this_year = visits_res.scalar_one()
+
+    # 9. Get follow-ups
+    stmt = (
+        select(Appointment)
+        .where(
+            Appointment.patient_id == patient_id,
+            Appointment.status.in_(["pending", "confirmed"])
+        )
+    )
+    result = await db.execute(stmt)
+    future_appointments = list(result.scalars().all())
+
+    follow_ups = []
+    seen_details_fu = set()
+    for c in consultations:
+        if not getattr(c, "followup_advised", False):
+            continue
+        days = getattr(c, "followup_after_days", 0) or 0
+        if days <= 0:
+            continue
+        if c.id in seen_details_fu:
+            continue
+        seen_details_fu.add(c.id)
+
+        recommended_date = c.consultation_datetime + timedelta(days=days)
+        has_future_booking = any(
+            appt.doctor_id == c.doctor_id and appt.appointment_datetime > c.consultation_datetime
+            for appt in future_appointments
+        )
+        status = "booked" if has_future_booking else "recommended"
+
+        treatment_type = "Routine Follow-up"
+        if c.diagnosis:
+            treatment_type = f"Follow-up for {c.diagnosis}"
+
+        follow_ups.append({
+            "id": c.id,
+            "consultation_id": c.id,
+            "doctor_id": c.doctor_id,
+            "doctor_name": c.doctor.user.full_name if c.doctor and c.doctor.user else "Doctor",
+            "branch_id": c.branch_id,
+            "branch_name": c.branch.name if c.branch else "Main Branch",
+            "recommended_date": recommended_date,
+            "treatment_type": treatment_type,
+            "notes": f"Recommended after {days} days based on visit on {c.consultation_datetime.strftime('%Y-%m-%d')}.",
+            "status": status,
+        })
+
+    return ApiResponse.success(
+        data={
+            "patient": PatientOut.model_validate(patient),
+            "upcoming_appointments_count": len(upcoming_appointments),
+            "active_prescriptions_count": len(prescriptions),
+            "balance_due": total_balance_due,
+            "visits_this_year": visits_this_year,
+            "upcoming_appointments": [to_patient_appt_out(a) for a in upcoming_appointments],
+            "appointment_history": [to_patient_appt_out(a) for a in appointment_history],
+            "prescriptions": [PrescriptionOut.model_validate(p) for p in prescriptions],
+            "medical_history": [ConsultationOut.model_validate(c) for c in consultations],
+            "reports": [MedicalReportOut.model_validate(r) for r in reports],
+            "bills": [InvoiceOut.model_validate(i) for i in invoices],
+            "follow_ups": [FollowUpRecommendationOut.model_validate(f) for f in follow_ups],
+        },
+        message="Patient history and profile details retrieved successfully.",
+    )
